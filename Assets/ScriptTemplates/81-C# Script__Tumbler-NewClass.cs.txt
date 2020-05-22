@@ -1,0 +1,14 @@
+﻿// TUMBLER
+// Copyright (c) 2020 Ted Brown
+
+using Jambox;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace Tumbler
+{
+	public class #SCRIPTNAME# : MonoBehaviour 
+	{
+	}
+}
