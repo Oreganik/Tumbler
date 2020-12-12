@@ -1,6 +1,9 @@
 ﻿// TUMBLER
 // Copyright (c) 2020 Ted Brown
 
+// https://vanderpelomundo.blogspot.com/2018/05/steam-vr-interactionsystem-unity-3d_7.html
+
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -8,36 +11,14 @@ namespace Tumbler
 {
 	public class TumbleObject : MonoBehaviour 
 	{
-		#region CONSTANTS
-		/// <summary>Determines when it's safe to return to fixed motion after flying back to the target location</summary>
-		private const float ARRIVE_DISTANCE = 0.1f; // 0.01 is 1cm
-
-		/// <summary>Determines when it's safe to return to fixed motion after flying back to the target location</summary>
-		private const float ARRIVE_ANGLE = 1;
-
-		// Constants: Velocity
-		/// <summary></summary>
-		private const float MAX_VELOCITY_AGAINST_OBJECTS = 15;
-		/// <summary></summary>
-		private const float MAX_VELOCITY_NO_CONTACTS = 50;
-		/// <summary></summary>
-		private const float MAX_ACCELERATION_AGAINST_OBJECTS = 1;
-		/// <summary></summary>
-		private const float MAX_ACCELERATION_NO_CONTACTS = 20;
-
-		// Constants: Angular Velocity
-		/// <summary></summary>
-		private const float MIN_DELTA_ROTATION_ANGLE = 0.002f;
-		/// <summary></summary>
-		private const float MAX_TORQUE_AGAINST_OBJECTS = 10;
-		/// <summary></summary>
-		private const float MAX_TORQUE_NO_CONTACTS = 360;
-
-		/// <summary>Every x seconds, clear null objects from the touched colliders hashset. Helpful if colliders might be destroyed while this object is held.</summary>
-		private const float CLEAR_NULL_COLLIDERS_DELAY = 0.5f;
+		#region EVENTS
+		public Action<TumbleObject> OnAttach;
+		public Action<TumbleObject> OnDetach;
 		#endregion
 
+		#region STATICS
 		private static PhysicMaterial s_heldObjectPhysicMaterial;
+		#endregion
 
 		#region PUBLIC PROPERTIES
 		public bool IsTouchingCollider
@@ -49,42 +30,115 @@ namespace Tumbler
 		{
 			get { return _useFixedOffset; }
 		}
+
+		public TumbleTarget TumbleTarget
+		{
+			get { return _tumbleTarget; }
+		}
+
+		public Vector3 HandlePosition
+		{
+			get { return _activeHandle == null ? transform.position : _activeHandle.position; }
+		}
+
+		public Vector3 OffsetPosition
+		{
+			get { return _offsetPosition; }
+		}
+
+		public Vector3 OffsetRotation
+		{
+			get { return _offsetRotation; }
+		}
 		#endregion
 
 		#region INSPECTOR FIELDS
 		#pragma warning disable 0649
-		[Tooltip("A Box, Sphere, or Capsule collider that covers the entire object")]
-		[SerializeField] private Collider _boundsCollider;
 		[Tooltip("Tumbler uses a standard physic material for held objects. It can be overriden here.")]
 		[SerializeField] private Collider _customPhysicMaterial;
+		[SerializeField] private bool _grabHitPoint;
 		[Tooltip("If true, target location is consistently relative to move target (e.g. a hand-held tool). If false, target location offset is set on grab.")]
 		[SerializeField] private bool _useFixedOffset;
 		[SerializeField] private Vector3 _offsetPosition;
 		[SerializeField] private Vector3 _offsetRotation;
+		[Tooltip("If there are transforms in this array, they will be used as 'handles' instead of the object pivot.")]
+		[SerializeField] private Transform[] _customHandles;
 		#pragma warning restore 0649
 		#endregion
 
 		#region PRIVATE FIELDS
-		private bool _isAttached;
+		private bool _hitColliderThisFrame;
+		private bool _isUsingPhysicsMotion;
 		private bool _wasUsingGravity;
 		private Collider[] _childColliders;
 		private Dictionary<Collider, PhysicMaterial> _originalPhysicMaterials;
-		private float _previousRotationAngle;
+		private float _previousDeltaAngle;
 		private float _lastClearedNullColliders;
 		private HashSet<Collider> _touchedColliders;
-		private Transform _moveTarget;
-		private Quaternion _rotationOffset;
 		private Rigidbody _rigidbody;
+		private Transform _activeHandle;
+		private Transform _hitPointHandle;
+		private Transform _previousParent;
+		private TumbleTarget _tumbleTarget;
+		private Vector3 _previousCenterOfMass;
 		private VelocityTracker _velocityTracker;
 		#endregion
 
 		#region PUBLIC METHODS
-		public void Grab (Transform moveTarget)
+		public Transform GetHandleForPointer (TumblePointer pointer)
 		{
-			_rotationOffset = Quaternion.Inverse(transform.rotation) * moveTarget.rotation;
+			if (_grabHitPoint)
+			{
+				_hitPointHandle.position = pointer.HitPoint;
+				return _hitPointHandle;
+			}
+
+			// If there are no custom handles, return this object's transform.
+			if (_customHandles.Length == 0)
+			{
+				return transform;
+			}
+
+			// Find the handle that is most in line with the pointer by using dot product.
+			float bestDotProduct = -1;
+			Transform bestTransform = null;
+			Vector3 pointerForward = pointer.Forward;
+
+			foreach (Transform handle in _customHandles)
+			{
+				Vector3 dir = (handle.position - pointer.transform.position).normalized;
+				float dot = Vector3.Dot(dir, pointerForward);
+				if (dot > bestDotProduct)
+				{
+					bestDotProduct = dot;
+					bestTransform = handle;
+				}
+			}
+
+			return bestTransform;
+		}
+
+		public void HandleGrab (TumbleTarget tumbleTarget, Transform handle)
+		{
+			_previousParent = transform.parent;
+			_tumbleTarget = tumbleTarget;
+			_activeHandle = handle;
+
 			_wasUsingGravity = _rigidbody.useGravity;
 			_rigidbody.useGravity = false;
-			_moveTarget = moveTarget;
+
+			_previousCenterOfMass = _rigidbody.centerOfMass;
+			_rigidbody.centerOfMass = transform.InverseTransformPoint(handle.position);
+
+			if (IsTouchingCollider)
+			{
+				// clearing the parent enables physics movement based on logic in FixedUpdate
+				transform.parent = null;
+			}
+			else
+			{
+				StartPhysicsMotion();
+			}
 
 			// Change the physic material of all child colliders
 			foreach (Collider collider in _childColliders)
@@ -99,8 +153,9 @@ namespace Tumbler
 
 		public void Release (Transform newParent = null)
 		{
-			// You can store the previous parent and restore it here, if you want.
-			transform.parent = newParent;
+			transform.parent = newParent == null ? _previousParent : newParent;
+
+			_rigidbody.centerOfMass = _previousCenterOfMass;
 			_rigidbody.useGravity = _wasUsingGravity;
 
 			// Restore the physic material of all child colliders
@@ -109,82 +164,57 @@ namespace Tumbler
 				collider.sharedMaterial = _originalPhysicMaterials[collider];
 			}
 
-			if (_isAttached)
+			Vector3 newVelocity = Vector3.ClampMagnitude(_velocityTracker.TrackedLinearVelocity, TumbleConfig.MaxVelocityNoContacts);
+
+			// If they are "held" in a single position, boost their velocity to match user expectations
+			if (_useFixedOffset && _isUsingPhysicsMotion == false)
 			{
-				_rigidbody.velocity = _velocityTracker.FrameLinearVelocity;
-				_rigidbody.angularVelocity = _velocityTracker.FrameAngularVelocity;
+				newVelocity *= TumbleConfig.ThrowSpeedMultiplier;
 			}
+
+			_rigidbody.velocity = newVelocity;
+			_rigidbody.angularVelocity = _velocityTracker.TrackedAngularVelocity;
 
 			_velocityTracker.Deactivate();
 
+			_tumbleTarget.HandleDetach();
 			enabled = false;
+
+			if (OnDetach != null)
+			{
+				OnDetach(this);
+			}
+		}
+
+		public static Vector3 ScalePosition (Vector3 p, Vector3 s)
+		{
+			p.x *= s.x;
+			p.y *= s.y;
+			p.z *= s.z;
+			return p;
 		}
 		#endregion
 
 		#region PRIVATE METHODS
-		private void AttachToMoveTarget ()
-		{
-			transform.parent = _moveTarget;
-			_rigidbody.velocity = Vector3.zero;
-			_rigidbody.angularVelocity = Vector3.zero;
-
-			if (_useFixedOffset)
-			{
-				transform.localPosition = _offsetPosition;
-				transform.localRotation = Quaternion.Euler(_offsetRotation);
-			}
-
-			_isAttached = true;
-		}
-
 		/// <summary>Run during FixedUpdate. Applies physics forces to reach target location.</summary>
-		private void FlexibleMove (Vector3 targetPosition, Quaternion targetRotation)
+		private void MoveTowardsLocation (Vector3 targetPosition, Quaternion targetRotation)
 		{
-			// Move to root of scene
-			if (transform.parent)
-			{
-				transform.parent = null;
-			}
-
-			// Position and velocity
-			Vector3 positionDelta = targetPosition - transform.position;
-			Vector3 velocityTarget = (positionDelta) * 1.0f / Time.fixedDeltaTime;
-
-			Vector3 newVelocity = _rigidbody.velocity;
-
-			if (float.IsNaN(velocityTarget.x) == false)
-			{
-				if (_touchedColliders.Count > 0)
-				{
-					newVelocity = Vector3.MoveTowards(newVelocity, velocityTarget, MAX_ACCELERATION_AGAINST_OBJECTS);
-					newVelocity = Vector3.ClampMagnitude(newVelocity, MAX_VELOCITY_AGAINST_OBJECTS);
-				}
-				else
-				{
-					newVelocity = Vector3.MoveTowards(newVelocity, velocityTarget, MAX_ACCELERATION_NO_CONTACTS);
-					newVelocity = Vector3.ClampMagnitude(newVelocity, MAX_VELOCITY_NO_CONTACTS);
-				}
-			}
-
-			_rigidbody.velocity = newVelocity;
-
 			// Rotation and angular velocity
 
 			// If we're applying force, see how far we need to go.
-			targetRotation = targetRotation * Quaternion.Inverse(_rotationOffset);
-			Quaternion deltaRotation = targetRotation * Quaternion.Inverse(transform.rotation);
+			Quaternion deltaRotation = _tumbleTarget.TargetRotation * Quaternion.Inverse(_activeHandle.rotation);
 			float angle;
 			Vector3 axis;
 			deltaRotation.ToAngleAxis(out angle, out axis);
 
-			if (angle > 180)
+			while (angle > 180)
 			{
 				angle -= 360;
 			}
 
 			angle *= Mathf.Deg2Rad;
 
-			if (angle != 0 && Mathf.Abs(angle - _previousRotationAngle) > MIN_DELTA_ROTATION_ANGLE)
+			if (angle != 0 && Mathf.Abs(angle - _previousDeltaAngle) > TumbleConfig.MinDeltaRotationAngle)
 			{
 				Vector3 angularTarget = angle * axis;
 				angularTarget = angularTarget * 1.0f / Time.fixedDeltaTime;
@@ -193,11 +223,11 @@ namespace Tumbler
 				{
 					if (_touchedColliders.Count > 0)
 					{
-						_rigidbody.angularVelocity = Vector3.MoveTowards(_rigidbody.angularVelocity, angularTarget, MAX_TORQUE_AGAINST_OBJECTS);
+						_rigidbody.angularVelocity = Vector3.MoveTowards(_rigidbody.angularVelocity, angularTarget, TumbleConfig.MaxTorqueAgainstObjects);
 					}
 					else
 					{
-						_rigidbody.angularVelocity = Vector3.MoveTowards(_rigidbody.angularVelocity, angularTarget, MAX_TORQUE_NO_CONTACTS);
+						_rigidbody.angularVelocity = Vector3.MoveTowards(_rigidbody.angularVelocity, angularTarget, TumbleConfig.MaxTorqueNoContacts);
 					}
 				}
 			}
@@ -206,31 +236,87 @@ namespace Tumbler
 				_rigidbody.angularVelocity = Vector3.zero;
 			}
 
-			_previousRotationAngle = angle;
+			_previousDeltaAngle = angle;
+
+
+			// Position and velocity
+			Vector3 velocity = _rigidbody.velocity;
+			Vector3 velocityTarget = (targetPosition - _activeHandle.position) / Time.fixedDeltaTime;
+
+			//if (float.IsNaN(velocityTarget.x) == false)
+			{
+				if (_touchedColliders.Count > 0)
+				{
+					velocity = Vector3.MoveTowards(velocity, velocityTarget, TumbleConfig.MaxAccelerationAgainstObjects * Time.fixedDeltaTime);
+					velocity = Vector3.ClampMagnitude(velocity, TumbleConfig.MaxVelocityAgainstObjects);
+				}
+				else
+				{
+					velocity = Vector3.MoveTowards(velocity, velocityTarget, TumbleConfig.MaxAccelerationNoContacts * Time.fixedDeltaTime);
+					velocity = Vector3.ClampMagnitude(velocity, TumbleConfig.MaxVelocityNoContacts);
+				}
+			}
+
+			_rigidbody.velocity = velocity;
 		}
 
-		private void StartFlexibleMove ()
+		private void StartPhysicsMotion ()
 		{
+			_isUsingPhysicsMotion = true;
 			transform.parent = null;
-			_isAttached = false;
+		}
+
+		private void StopPhysicsMotion ()
+		{
+			_isUsingPhysicsMotion = false;
+			transform.parent = _tumbleTarget.transform;
+			_rigidbody.velocity = Vector3.zero;
+			_rigidbody.angularVelocity = Vector3.zero;
+
+			// If a fixed offset is used, the TumbleTarget -- our parent -- is already at the target location.
+			if (_useFixedOffset)
+			{
+				if (_activeHandle)
+				{
+					transform.localRotation = _activeHandle.localRotation;
+
+					// for position, take object scale into account.
+					Vector3 offset = _activeHandle.localPosition * -1;
+
+					Transform tScaler = _activeHandle.transform;
+					offset = ScalePosition(offset, tScaler.localScale);
+
+					while (tScaler != transform)
+					{
+						tScaler = tScaler.parent;
+						offset = ScalePosition(offset, tScaler.localScale);
+
+						if (tScaler == transform.root)
+						{
+							Debug.LogWarning("TumbleObject handle appears to be outside of gameobject", gameObject);
+							break;
+						}
+					}
+
+					transform.localPosition = offset;
+				}
+				else
+				{
+					transform.localPosition = Vector3.zero;
+					transform.localRotation = Quaternion.identity;
+				}
+			}
+
+			if (OnAttach != null)
+			{
+				OnAttach(this);
+			}
 		}
 		#endregion
 
 		#region MONOBEHAVIOUR EVENTS
 		protected void Awake ()
 		{
-			if (_boundsCollider == null)
-			{
-				_boundsCollider = GetComponent<Collider>();
-			}
-
-			if (_boundsCollider == null)
-			{
-				Debug.LogWarning("TumbleObject on " + gameObject.name + " does not have a bounds collider. Disabling.", gameObject);
-				Destroy(this);
-				return;
-			}
-
 			_rigidbody = GetComponentInParent<Rigidbody>();
 
 			if (_rigidbody == null)
@@ -264,51 +350,119 @@ namespace Tumbler
 
 			_touchedColliders = new HashSet<Collider>();
 
+			if (_grabHitPoint)
+			{
+				_hitPointHandle = new GameObject("Hit Point Handle").transform;
+				_hitPointHandle.parent = transform;
+			}
+
 			enabled = false;
+		}
+
+		protected virtual bool HasArrivedAtPosition (Vector3 center, Vector3 targetPosition, float arriveDistance)
+		{
+			Vector3 delta = targetPosition - center;
+			return delta.magnitude < arriveDistance;
+		}
+
+		protected virtual bool HasArrivedAtRotation (Quaternion center, Quaternion targetRotation, float arriveAngle)
+		{
+			Quaternion deltaQuaternion = targetRotation * Quaternion.Inverse(center);
+			float deltaAngle;
+			Vector3 axis;
+			deltaQuaternion.ToAngleAxis(out deltaAngle, out axis);
+			if (deltaAngle > 180) deltaAngle -= 360;
+			return Mathf.Abs(deltaAngle) < arriveAngle;
+		}
+
+		protected virtual void MoveTowardsPosition (Vector3 center, Vector3 targetPosition, float arriveDistance)
+		{
+			Vector3 delta = targetPosition - center;
+			Vector3 velocity = _rigidbody.velocity;
+			Vector3 velocityTarget = delta / Time.fixedDeltaTime;
+
+			if (IsTouchingCollider)
+			{
+				velocity = Vector3.MoveTowards(velocity, velocityTarget, TumbleConfig.MaxAccelerationAgainstObjects * Time.fixedDeltaTime);
+				velocity = Vector3.ClampMagnitude(velocity, TumbleConfig.MaxVelocityAgainstObjects);
+			}
+			else
+			{
+				velocity = Vector3.MoveTowards(velocity, velocityTarget, TumbleConfig.MaxAccelerationNoContacts * Time.fixedDeltaTime);
+				velocity = Vector3.ClampMagnitude(velocity, TumbleConfig.MaxVelocityNoContacts);
+			}
+
+			_rigidbody.velocity = velocity;
+		}
+
+		protected virtual bool RotateTowardsRotation (Quaternion center, Quaternion targetRotation, float arriveAngle)
+		{
+			Quaternion deltaQuaternion = targetRotation * Quaternion.Inverse(center);
+			float deltaAngle;
+			Vector3 axis;
+			deltaQuaternion.ToAngleAxis(out deltaAngle, out axis);
+			if (deltaAngle > 180) deltaAngle -= 360;
+
+			Vector3 angularTarget = deltaAngle * Mathf.Deg2Rad * axis;
+			angularTarget = angularTarget / Time.fixedDeltaTime;
+
+			if (float.IsNaN(angularTarget.x) == false)
+			{
+				if (_touchedColliders.Count > 0)
+				{
+					_rigidbody.angularVelocity = Vector3.MoveTowards(_rigidbody.angularVelocity, angularTarget, TumbleConfig.MaxTorqueAgainstObjects);
+				}
+				else
+				{
+					_rigidbody.angularVelocity = Vector3.MoveTowards(_rigidbody.angularVelocity, angularTarget, TumbleConfig.MaxTorqueNoContacts);
+				}
+			}
+
+			return false;
 		}
 
 		protected void FixedUpdate ()
 		{
-			if (_isAttached)
+			if (_tumbleTarget == null)
 			{
-				if (IsTouchingCollider)
+				return;
+			}
+
+			// Determine if the object is at the target position
+			float arriveDistance = _useFixedOffset ? TumbleConfig.ArriveDistanceFixedOffset : TumbleConfig.ArriveDistance;
+			bool hasArrivedAtPosition = HasArrivedAtPosition(_activeHandle.position, _tumbleTarget.TargetPosition, arriveDistance);
+
+			// Determine if the object is at the target rotation
+			float arriveAngle = _useFixedOffset ? TumbleConfig.ArriveAngleFixedOffset : TumbleConfig.ArriveAngle;
+			bool hasArrivedAtRotation = HasArrivedAtRotation(_activeHandle.rotation, _tumbleTarget.TargetRotation, arriveAngle);
+
+			if (hasArrivedAtPosition && hasArrivedAtRotation)
+			{
+				if (_isUsingPhysicsMotion)
 				{
-					StartFlexibleMove();
+					StopPhysicsMotion();
 				}
+				// otherwise... nothing to do
 			}
 			else
 			{
-				// Push the object so it tries to reach its target location
-				FlexibleMove(_moveTarget.position, _moveTarget.rotation);
-
-				// If it's free of colliders, we might be able to return to attached mode...
-				if (IsTouchingCollider == false)
+				if (_isUsingPhysicsMotion == false)
 				{
-					// Is it close enough by distance?
-					if (Vector3.Distance(transform.position, _moveTarget.position) < ARRIVE_DISTANCE)
-					{
-						// Is it close enough by rotation?
-						Quaternion targetRotation = _moveTarget.rotation * Quaternion.Inverse(_rotationOffset);
-						Quaternion deltaRotation = targetRotation * Quaternion.Inverse(transform.rotation);
-						float angle;
-						Vector3 axis;
-						deltaRotation.ToAngleAxis(out angle, out axis);
-
-						if (angle > 180)
-						{
-							angle -= 360;
-						}
-
-						if (Mathf.Abs(angle) < ARRIVE_ANGLE)
-						{
-							AttachToMoveTarget();
-						}
-					}
+					StartPhysicsMotion();
 				}
+				RotateTowardsRotation(_activeHandle.rotation, _tumbleTarget.TargetRotation, TumbleConfig.ArriveAngle);
+				MoveTowardsPosition(_activeHandle.position, _tumbleTarget.TargetPosition, arriveDistance);
 			}
 		}
 
 		protected void OnCollisionEnter(Collision collision)
+		{
+			_hitColliderThisFrame = true;
+			// Add to a hashset. If it already exists, it will be rejected.
+			_touchedColliders.Add(collision.collider);
+		}
+
+		protected void OnCollisionStay (Collision collision)
 		{
 			// Add to a hashset. If it already exists, it will be rejected.
 			_touchedColliders.Add(collision.collider);
@@ -322,11 +476,12 @@ namespace Tumbler
 
 		protected void Update ()
 		{
+			_lastClearedNullColliders += Time.deltaTime;
 			// Remove null colliders from _touchedColliders every CLEAR_NULL_COLLIDERS_DELAY seconds
-			if (Time.time > _lastClearedNullColliders + CLEAR_NULL_COLLIDERS_DELAY)
+			if (_lastClearedNullColliders > TumbleConfig.ClearNullCollidersDelay)
 			{
 				_touchedColliders.RemoveWhere(x => x == null);
-				_lastClearedNullColliders = Time.time;
+				_lastClearedNullColliders = 0;
 			}
 		}
 		#endregion

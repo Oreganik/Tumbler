@@ -4,5 +4,12 @@
 EditorBuildSettings:
   m_ObjectHideFlags: 0
   serializedVersion: 2
-  m_Scenes: []
-  m_configObjects: {}
+  m_Scenes:
+  - enabled: 1
+    path: Assets/Tumbler/Example/Scenes/T09.unity
+    guid: a5a195bc2de9f84459a2b7867eb2ccde
+  m_configObjects:
+    Unity.XR.Oculus.Settings: {fileID: 11400000, guid: 0f38797bb231995469bbbe9f1424e8cc,
+      type: 2}
+    com.unity.xr.management.loader_settings: {fileID: 11400000, guid: c9cd33f5685114e4eaed059b0636922b,
+      type: 2}
